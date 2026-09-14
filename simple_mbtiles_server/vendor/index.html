@@ -308,6 +308,7 @@
       <div id="toolbar">
       <label class="toolbar-btn">GPX laden<input type="file" id="gpx-input" accept=".gpx" style="display:none"></label>
       <button id="gpx-clear" class="toolbar-btn" title="Track entfernen">🗑</button>
+      <button id="skill-btn" class="toolbar-btn" title="OpenCode-Skill (SKILL.md) für die Tourenplanung per LLM-Agent herunterladen — nach .opencode/skills/gpx/ oder ~/.config/opencode/skills/gpx/ legen">🤖 Skill</button>
       <select id="style-select" class="toolbar-btn">
         <option value="osm-bright-gl-style">OSM Bright</option>
         <option value="dark-matter-gl-style">Dark Matter</option>
@@ -1082,6 +1083,11 @@
         });
 
         // --- Ende Info-Picker ---
+
+        // OpenCode-Skill (SKILL.md) herunterladen
+        document.getElementById('skill-btn').addEventListener('click', function() {
+          window.location.href = '/skill';
+        });
 
         // GPX Track entfernen
         document.getElementById('gpx-clear').addEventListener('click', function() {

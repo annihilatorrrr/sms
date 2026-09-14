@@ -2966,6 +2966,32 @@ def simple_mbtiles_server(
         resp.headers["cache-control"] = "no-cache"
         return resp
 
+    def get_skill():
+        # OpenCode agent skill (SKILL.md) for the MCP endpoint of this
+        # server. The base URL is injected at request time so the file works
+        # behind any reverse proxy without a build step -- same reasoning as
+        # the style.json URL injection.
+        path = os.path.join(
+            os.path.dirname(os.path.realpath(__file__)), "vendor", "SKILL.md"
+        )
+        try:
+            with open(path, "rb") as f:
+                text = f.read().decode("utf-8")
+        except OSError:
+            return _json({"error": "SKILL.md not bundled"}, 404)
+        base_url = request.url_root.rstrip("/")
+        text = text.replace("__SMS_BASE_URL__", base_url)
+        return Response(
+            status=200,
+            response=text,
+            headers={
+                "content-type": "text/markdown; charset=utf-8",
+                "content-disposition": 'attachment; filename="SKILL.md"',
+                # Contains the request-derived base URL, so no shared cache.
+                "cache-control": "private, max-age=3600",
+            },
+        )
+
     def get_capabilities():
         return Response(
             status=200,
@@ -3756,6 +3782,7 @@ def simple_mbtiles_server(
         return resp
 
     app.add_url_rule("/", view_func=get_index)
+    app.add_url_rule("/skill", view_func=get_skill)
     app.add_url_rule("/v1/capabilities", view_func=get_capabilities)
     app.add_url_rule("/mcp", view_func=post_mcp, methods=["POST"])
     app.add_url_rule("/mcp", view_func=get_mcp, methods=["GET"], endpoint="get_mcp")

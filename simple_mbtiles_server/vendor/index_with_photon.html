@@ -519,6 +519,7 @@
           <div class="tb-page" id="tb-page-2">
             <label class="toolbar-btn">GPX laden<input type="file" id="gpx-input" accept=".gpx" style="display:none"></label>
             <button id="gpx-clear" class="toolbar-btn" title="Track entfernen">🗑</button>
+            <button id="skill-btn" class="toolbar-btn" title="OpenCode-Skill (SKILL.md) für die Tourenplanung per LLM-Agent herunterladen — nach .opencode/skills/gpx/ oder ~/.config/opencode/skills/gpx/ legen">🤖 Skill</button>
             <button id="measure-btn" class="toolbar-btn" title="Distanz messen (Klick: Punkt setzen, Doppelklick: beenden)">📏</button>
             <span id="measure-result" style="display:none"></span>
             <button id="info-btn" class="toolbar-btn" title="Punkt-Info: Klick auf Karte zeigt Koordinaten und Adresse">📍 Info</button>
@@ -1011,6 +1012,11 @@
           if (routeSegments.length > 0) addRouteLayers();
         });
         // --- Ende Distanzmessung ---
+
+        // OpenCode-Skill (SKILL.md) herunterladen
+        document.getElementById('skill-btn').addEventListener('click', function() {
+          window.location.href = '/skill';
+        });
 
         // GPX Track entfernen
         document.getElementById('gpx-clear').addEventListener('click', function() {
