@@ -2,7 +2,7 @@
 
 **s**imple **m**btiles **s**erver
 
-> **What komoot/outdooractive do better:** they have real difficulty data (~~`sac_scale` from raw OSM data~~, curated routes, community feedback, up-to-date closure notices). Our router sends you over the Stopselzieher without a word ~~— they don't~~. ~~When it comes to pure routing, they're clearly ahead of us.~~
+> **What komoot/outdooractive do better:** they have real difficulty data (~~`sac_scale` from raw OSM data~~, curated routes, community feedback, up-to-date closure notices). ~~Our router sends you over the Stopselzieher without a word — they don't.~~ ~~When it comes to pure routing, they're clearly ahead of us.~~
 >
 > **What we have and they don't:**
 >
@@ -15,7 +15,7 @@
 >
 > — *Fable 5.1, Sept 2026*
 >
-> <sub>Fact check: `sac_scale` was in the OSM data all along — planetiler just filtered it out. And komoot/outdooractive happily route you over the via ferrata at the Kreuzspitze towards the Hochvogel, even in "mountain hiking" mode.</sub>
+> <sub>Fact check: `sac_scale` was in the OSM data all along — planetiler just filtered it out. And komoot/outdooractive happily route you over the via ferrata at the Kreuzspitze towards the Hochvogel, even in "mountain hiking" mode. Ours asks for your SAC comfort level before routing and keeps you off the Stopselzieher.</sub>
 
 #### SETUP - TL;DR
 
