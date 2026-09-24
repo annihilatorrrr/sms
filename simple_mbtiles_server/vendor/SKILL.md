@@ -1,6 +1,6 @@
 ---
 name: gpx
-description: wander- und trekkingplanung auf einem selbstgehosteten sms-server (openmaptiles vector tiles) via mcp — geocoding, poi-suche (hütten, wasser, versorgung), mehrpunkt-routenplanung mit schwierigkeitsfiltern (sac-skala, klettersteig-ausschluss) und gpx-export. nutzen, wenn touren, routen, gpx-tracks oder pois rund ums wandern/radfahren geplant werden sollen. wichtig: vor der ersten routenplanung den maximalen sac-schwierigkeitsgrad und klettersteig-ja/nein beim nutzer erfragen.
+description: wander- und trekkingplanung auf einem selbstgehosteten sms-server (openmaptiles vector tiles) via mcp — geocoding, poi-suche (hütten, wasser, versorgung), mehrpunkt-routenplanung mit schwierigkeitsfiltern (sac-skala, klettersteig-ausschluss), gpx-export und bewertung vorhandener gpx-tracks (wegarten, schwierigkeit, höhenmeter, versorgung entlang der strecke). nutzen, wenn touren, routen, gpx-tracks oder pois rund ums wandern/radfahren geplant oder geprüft werden sollen. wichtig: vor der ersten routenplanung den maximalen sac-schwierigkeitsgrad und klettersteig-ja/nein beim nutzer erfragen.
 metadata:
   server: __SMS_BASE_URL__
 ---
@@ -189,6 +189,54 @@ beliebige koordinatenliste als gpx.
 
 nur nutzen, wenn du einen track schon hast. für planung: `plan_route`.
 
+### `analyze_gpx`
+vorhandenen gpx-track bewerten: wegarten, schwierigkeit, höhenmeter,
+markierte wege, versorgung entlang der strecke.
+- `gpx_id` (pflicht) — aus `plan_route`, `export_gpx` oder einem upload
+- `profile`, `poi_categories` (default: hütten, unterstände, camping,
+  wasser, supermarkt, notfall), `poi_max_off_km` (default 1, max 5),
+  `elevation_source` (`auto` | `gpx` | `contours`)
+
+**track hochladen:** mcp ist json, ein 5000-punkte-track im tool-aufruf
+frisst den kontext. deshalb erst per http hochladen, dann mit der id
+arbeiten:
+
+```bash
+curl -s -X POST --data-binary @tour.gpx __SMS_BASE_URL__/v1/gpx
+# → {"gpx_id": "5c92…", "points": 4812, "has_elevation": true, …}
+```
+
+**niemals** den xml-inhalt der datei in den kontext lesen, um ihn
+weiterzureichen — immer den upload-weg.
+
+**was das ergebnis bedeutet:**
+- `matched_percent` / `off_network_km` / `off_network_sections`: anteil
+  des tracks, der **keinem kartierten weg** folgt (>30 m abseits).
+  das ist entweder weglos (alpin, gletscher, furt) **oder** in den
+  tiles fehlt der weg. **du kannst das nicht unterscheiden** — sag es
+  so, und behandle diese abschnitte als unbekannte schwierigkeit
+- `road_classes_km` / `surface_km`: wieviel asphalt (`minor`,
+  `service`), forstweg (`track`), pfad (`path`). ein 20-km-tag mit 15 km
+  `path` ist etwas anderes als 15 km `track`
+- `terrain_warnings` mit `at km X`: **wörtlich durchreichen**, wie bei
+  `plan_route`. gleiche datenlage, gleiche grenzen — kein `sac_scale`
+  heißt unbekannt, nicht leicht
+- `routes`: welchen markierten wegen der track folgt, mit anteil
+- `poi_summary[kat].max_gap_km`: **längste strecke ohne** diese
+  kategorie, start und ende zählen mit. „16 km ohne wasser" ist die
+  zahl, die entscheidet, wieviel man trägt. `pois[]` hat `at_km` und
+  `off_track_m` — ein brunnen 900 m abseits ist ein umweg, kein
+  versorgungspunkt
+- `elevation_source`: `gpx` = eigene `<ele>` des tracks mit 10-m-hysterese
+  (barometer gut, reines gps überschätzt), `contours` = höhenlinien des
+  servers. bei zweifel mit `elevation_source: "contours"` gegenprüfen
+  und beide zahlen nennen
+
+**typischer ablauf:** upload → `analyze_gpx` → gegebenenfalls
+`search_poi` um einen konkreten punkt (z.b. hütte im seitental außerhalb
+`poi_max_off_km`) → antwort mit distanz, dauer, höhenmeter,
+weganteilen, warnungen, versorgungslücken und dem sicherheitshinweis.
+
 ## aktuelle daten online nachrecherchieren
 
 die tiles sind ein statischer osm-abzug. öffnungszeiten, preise,
@@ -215,6 +263,11 @@ erfinden. widerspricht die webquelle den tiles, gilt die webquelle.
 3. tour → `plan_route` mit `max_sac_scale` + `allow_via_ferrata` aus
    schritt 0, bei >50 km luftlinie in etappen
 4. ergebnis: distanz, dauer, höhenmeter, gpx-link + sicherheitshinweis
+
+**track bewerten statt planen:** nutzer bringt gpx mit → upload per
+`POST /v1/gpx` → `analyze_gpx` → versorgungslücken, weganteile,
+off-network-abschnitte und warnungen berichten. schritt 0 entfällt (es
+wird nichts geroutet), der sicherheitshinweis nicht.
 
 ## antwortformat
 

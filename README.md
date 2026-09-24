@@ -2,6 +2,21 @@
 
 **s**imple **m**btiles **s**erver
 
+> **What komoot/outdooractive do better:** they have real difficulty data (~~`sac_scale` from raw OSM data~~, curated routes, community feedback, up-to-date closure notices). Our router sends you over the Stopselzieher without a word ~~— they don't~~. ~~When it comes to pure routing, they're clearly ahead of us.~~
+>
+> **What we have and they don't:**
+>
+> - **Agent-native.** "Plan me a 3-day tour with hut stays, check the opening hours" is an afternoon of clicking on komoot — here it's one sentence. They have no MCP interface and won't build one anytime soon; their business model is keeping you inside their app.
+> - **Composability.** geocode → poi → route → gpx → nextcloud are building blocks the agent chains freely and enriches with web research. Over there it's a monolith.
+> - **Self-hosted, offline, no paywall.** The komoot world pack costs money, so does outdooractive pro, and both phone home.
+> - **Transparency.** When our router screws up, I can measure why. Their black box you can only doubt.
+>
+> We didn't build the better router — we built the better **interface for LLM agents**. A dumb-but-honest router + an agent that fills the gaps via web search + GPX export: that's the real lever.
+>
+> — *Fable 5.1, Sept 2026*
+>
+> <sub>Fact check: `sac_scale` was in the OSM data all along — planetiler just filtered it out. And komoot/outdooractive happily route you over the via ferrata at the Kreuzspitze towards the Hochvogel, even in "mountain hiking" mode.</sub>
+
 #### SETUP - TL;DR
 
 ```
@@ -107,6 +122,7 @@ Tilesets are configured through numbered environment variable groups
 | `GPX_DIR` | no | Where generated GPX files are stored (default `$TMPDIR/sms-gpx`) |
 | `GPX_MAX_FILES` | no | Keep at most this many GPX files (default 200) |
 | `GPX_TTL_SECONDS` | no | Delete GPX files older than this (default 86400) |
+| `GPX_MAX_UPLOAD_BYTES` | no | Size limit for `POST /v1/gpx` uploads (default 10 MiB) |
 
 
 ## HELP WANTED
@@ -624,6 +640,46 @@ Generated files are cleaned up automatically: anything older than
 - `404` — unknown or expired id
 
 
+### `POST /v1/gpx`
+
+Upload a GPX file and get a `gpx_id` back — the input side of the
+`analyze_gpx` MCP tool. The body is either the raw document
+(`application/gpx+xml`, `text/xml`, anything) or a multipart form with a
+`file` field. GPX 1.0 and 1.1 are accepted, `<trk>` segments are
+concatenated, `<rte>` is used when there is no track. Files with a `DOCTYPE`
+or entity declarations are rejected (no `defusedxml` dependency, so no
+entity expansion at all).
+
+```bash
+curl -s -X POST --data-binary @tour.gpx localhost:9000/v1/gpx
+```
+
+```json
+{
+  "gpx_id": "5c925fc1584040a4",
+  "gpx_url": "http://localhost:9000/v1/gpx/5c925fc1584040a4.gpx",
+  "name": "Karwendel-Durchquerung",
+  "points": 4812,
+  "waypoints": 3,
+  "has_elevation": true
+}
+```
+
+The file is stored verbatim (download is byte-identical) and subject to the
+same TTL / max-files housekeeping as generated tracks.
+
+**Error responses:**
+- `400` — not a usable GPX (malformed, fewer than two points, `DOCTYPE`)
+- `413` — larger than `GPX_MAX_UPLOAD_BYTES`
+
+
+### `GET /v1/gpx/{id}/analysis`
+
+REST twin of the `analyze_gpx` MCP tool (see below). Query parameters:
+`profile`, `poi_categories` (comma separated), `poi_max_off_km`,
+`elevation_source`, `tileset`.
+
+
 ### Map UI routing options
 
 The map UI exposes the same knobs: a transport dropdown (hiking / bike), a
@@ -647,7 +703,7 @@ that can be cached is cached, and everything dynamic explicitly is not:
 | `/v1/styles/…/style.json` | `public, max-age=3600` | embeds request-derived URLs |
 | `/v1/gpx/<id>.gpx` | `private, max-age=86400` | stable per id, but user generated |
 | `/` | `no-cache` | rewritten by `startup.sh`, revalidates via ETag |
-| `/v1/route`, `/v1/poi`, `/v1/capabilities`, `/mcp` | `no-store` | a stale route is worse than a recomputed one |
+| `/v1/route`, `/v1/poi`, `/v1/gpx/<id>/analysis`, `/v1/capabilities`, `/mcp` | `no-store` | a stale route is worse than a recomputed one |
 
 **Tile ETags are `<dataset>-<z>-<x>-<y>`**, where `dataset` is a fingerprint of
 the `.mbtiles` file (mtime and size). Rebuilding the dataset therefore
@@ -702,6 +758,7 @@ curl -s localhost:9000/mcp -H 'content-type: application/json' \
 | `search_poi` | huts, water, resupply around a point | — |
 | `plan_route` | multi-waypoint tour + GPX export | — |
 | `export_gpx` | write arbitrary coordinates as GPX | — |
+| `analyze_gpx` | assess an uploaded GPX track: ways, difficulty, elevation, POIs along it | — |
 
 `plan_route` takes `waypoints: [[lat, lon], ...]` and routes each consecutive
 pair separately. Each single segment must stay under `max_crow_km`, but the
@@ -749,6 +806,67 @@ tool returns metadata plus a URL:
   "gpx_url": "https://maps.example.org/v1/gpx/5c925fc1584040a4.gpx"
 }
 ```
+
+### `analyze_gpx` — assessing an existing track
+
+The reverse direction: the user already has a GPX (from a tour portal, a
+friend, last year's recording) and wants to know what they are getting into.
+Upload it with `POST /v1/gpx`, then call `analyze_gpx` with the `gpx_id`. The
+ids returned by `plan_route` and `export_gpx` work as well, so an agent can
+plan a tour and immediately check it for water and huts along the way.
+
+The track is **map-matched** onto the tile network: it is resampled every
+20 m and each sample is snapped to the nearest transportation segment within
+30 m. From the matched segments the tool reports way classes, surfaces,
+tagged difficulty and marked routes — everything `plan_route` reports, plus
+the km position on the track (`"VIA FERRATA at km 12.0 (…)"`). Samples with
+no way within 30 m count as **off-network**: pathless terrain (alpine
+crossings, glaciers, fords) *or* ways missing in the tiles — either way the
+agent cannot say anything about those sections and is told so.
+
+POIs are collected along the corridor with their position on the track and
+distance off it. `poi_summary` gives, per category, the count and the
+**longest gap** — "16 km without drinking water" is the number that decides
+how much to carry.
+
+```json
+{
+  "name": "Forststeig Etappe 3",
+  "distance_km": 18.4,
+  "duration_min": 372,
+  "elevation_source": "gpx",
+  "ascent_m": 640, "descent_m": 710, "min_ele_m": 312, "max_ele_m": 561,
+  "matched_percent": 94,
+  "off_network_km": 1.1,
+  "off_network_sections": [{ "from_km": 7.2, "to_km": 8.1, "length_km": 0.9 }],
+  "road_classes_km": { "path": 12.3, "track": 4.9, "minor": 1.2 },
+  "surface_km": { "ground": 6.1, "gravel": 3.2 },
+  "max_sac_scale": "T2",
+  "routes": [{ "network": "rwn", "network_label": "regional", "name": "Forststeig", "share_percent": 71 }],
+  "terrain_warnings": ["hardest section on this route is T2 = mountain_hiking at km 9.6 (…)"],
+  "poi_summary": {
+    "drinking_water": { "count": 2, "max_gap_km": 11.3 },
+    "shelter": { "count": 5, "max_gap_km": 6.0 },
+    "alpine_hut": { "count": 0, "max_gap_km": 18.4 }
+  },
+  "pois": [
+    { "name": "Taubenteich", "category": "drinking_water", "at_km": 3.1, "off_track_m": 40, "lat": 50.8794, "lon": 14.1201 }
+  ]
+}
+```
+
+| Argument | Purpose |
+|---|---|
+| `gpx_id` | from `POST /v1/gpx`, `plan_route` or `export_gpx` (required) |
+| `profile` | `foot` / `bike`, for the duration estimate |
+| `poi_categories` | default `alpine_hut, shelter, camp_site, drinking_water, supermarket, emergency` |
+| `poi_max_off_km` | corridor half-width for POIs (default 1, max 5) |
+| `elevation_source` | `auto` (track `<ele>` when ≥ 90 % of points have it, else contours), `gpx`, `contours` |
+| `tileset` | `identifier@version` |
+
+Elevation from the track's own `<ele>` is smoothed with a 10 m hysteresis;
+barometric recordings are good, plain GPS elevation still tends to overstate.
+Pass `elevation_source: "contours"` to cross-check.
 
 ### What the agent can and cannot know
 

@@ -1350,3 +1350,377 @@ def test_plan_route_description_warns_about_missing_difficulty(server):
     description = tools['plan_route']['description']
     for term in ('sac_scale', 'trail_visibility', '500 m'):
         assert term in description
+
+
+# ---------------------------------------------------------------------------
+# GPX import / analysis
+# ---------------------------------------------------------------------------
+
+from simple_mbtiles_server.gpx import GpxError, gpx_ascent_descent, parse_gpx  # noqa: E402
+
+
+def _gpx_doc(points, name='Testtour', ns=True, ele=None, wpts=(), rte=False):
+    """points: [(lat, lon), ...]; ele: parallel list or None."""
+    attrs = ' xmlns="http://www.topografix.com/GPX/1/1"' if ns else ''
+    pts = []
+    tag = 'rtept' if rte else 'trkpt'
+    for i, (lat, lon) in enumerate(points):
+        inner = ''
+        if ele is not None and ele[i] is not None:
+            inner = '<ele>%.1f</ele>' % ele[i]
+        pts.append('<%s lat="%.6f" lon="%.6f">%s</%s>' % (tag, lat, lon, inner, tag))
+    w = ''.join(
+        '<wpt lat="%.6f" lon="%.6f"><name>%s</name></wpt>' % (la, lo, n)
+        for la, lo, n in wpts
+    )
+    if rte:
+        body = '<rte><name>%s</name>%s</rte>' % (name, ''.join(pts))
+    else:
+        body = '<trk><name>%s</name><trkseg>%s</trkseg></trk>' % (name, ''.join(pts))
+    return '<?xml version="1.0"?><gpx version="1.1" creator="t"%s>%s%s</gpx>' % (
+        attrs, w, body)
+
+
+def _grid_track(lat, lon_start, lon_end, step=0.0005):
+    """Points along an east-west fixture way (class=path) on the lat raster."""
+    pts = []
+    lon = lon_start
+    while lon <= lon_end + 1e-9:
+        pts.append((lat, lon))
+        lon += step
+    return pts
+
+
+def test_parse_gpx_variants():
+    pts = [(48.1, 11.5), (48.11, 11.51), (48.12, 11.52)]
+    for ns in (True, False):
+        parsed = parse_gpx(_gpx_doc(pts, ns=ns, wpts=[(48.1, 11.5, 'Start &amp; Ziel')]))
+        assert parsed['name'] == 'Testtour'
+        assert [(round(p[1], 2), round(p[0], 2)) for p in parsed['points']] == pts
+        assert parsed['points'][0][2] is None
+        assert parsed['waypoints'] == [{'lat': 48.1, 'lon': 11.5, 'name': 'Start & Ziel'}]
+        assert parsed['tracks'] == 1
+
+    # bytes input, <rte> fallback, elevations
+    parsed = parse_gpx(_gpx_doc(pts, rte=True, ele=[500, 510, 505]).encode())
+    assert len(parsed['points']) == 3
+    assert parsed['points'][1][2] == 510.0
+
+    # gpx 1.0 namespace
+    doc = _gpx_doc(pts).replace('GPX/1/1', 'GPX/1/0')
+    assert len(parse_gpx(doc)['points']) == 3
+
+    # a track written by our own exporter round-trips
+    parsed = parse_gpx(to_gpx([[11.5, 48.1], [11.51, 48.11]], name='own', elevations=[1, 2]))
+    assert parsed['name'] == 'own'
+    assert parsed['points'][1] == [11.51, 48.11, 2.0]
+
+
+def test_parse_gpx_rejects_garbage():
+    with pytest.raises(GpxError):
+        parse_gpx('')
+    with pytest.raises(GpxError):
+        parse_gpx('<gpx><trk><trkseg><trkpt lat="1" lon="2"/></trkseg></trk></gpx>')
+    with pytest.raises(GpxError):
+        parse_gpx('<html><body>nope</body></html>')
+    with pytest.raises(GpxError):
+        parse_gpx('<gpx><trk><trkseg><trkpt lat="1" lon="2">')
+    with pytest.raises(GpxError, match='DOCTYPE'):
+        parse_gpx('<?xml version="1.0"?><!DOCTYPE gpx [<!ENTITY x "y">]>'
+                  '<gpx><trk><trkseg><trkpt lat="1" lon="2"/>'
+                  '<trkpt lat="1" lon="3"/></trkseg></trk></gpx>')
+    with pytest.raises(GpxError, match='too many'):
+        parse_gpx(_gpx_doc([(48.0, 11.0 + i * 0.0001) for i in range(20)]), max_points=10)
+    # out-of-range coordinates are dropped, not fatal
+    parsed = parse_gpx(_gpx_doc([(48.0, 11.0), (99.0, 11.0), (48.0, 11.1)]))
+    assert len(parsed['points']) == 2
+
+
+def test_gpx_ascent_descent_hysteresis():
+    # clean climb, descent, climb
+    assert gpx_ascent_descent([100, 200, 150, 250]) == (200, 50)
+    # GPS jitter of +-3 m must not add up
+    noisy = [500 + (3 if i % 2 else -3) for i in range(200)]
+    assert gpx_ascent_descent(noisy) == (0, 0)
+    # real climb underneath the jitter is still counted
+    noisy_climb = [500 + i + (3 if i % 2 else -3) for i in range(200)]
+    ascent, descent = gpx_ascent_descent(noisy_climb)
+    assert 190 <= ascent <= 210 and descent == 0
+    assert gpx_ascent_descent([None, None]) == (0, 0)
+    assert gpx_ascent_descent([100, None, 150]) == (50, 0)
+
+
+def test_resample_and_match():
+    from simple_mbtiles_server.__main__ import (
+        _E5, _build_segment_index, _match_samples, _resample_path,
+    )
+
+    # 1 km east-west line
+    coords = [[11.5, 48.1], [11.5 + 1.0 / (111.32 * math.cos(math.radians(48.1))), 48.1]]
+    samples, total = _resample_path(coords, step_km=0.02)
+    assert abs(total - 1.0) < 0.01
+    assert 50 <= len(samples) <= 52
+    assert samples[0][2] == 0.0 and abs(samples[-1][2] - total) < 1e-9
+    # spacing is uniform
+    gaps = [samples[i + 1][2] - samples[i][2] for i in range(len(samples) - 2)]
+    assert all(abs(g - 0.02) < 1e-9 for g in gaps)
+
+    # a way 10 m north of the line matches, one 100 m north does not
+    def seg(lat_off):
+        a = (int(round(11.5 * _E5)), int(round((48.1 + lat_off) * _E5)))
+        b = (int(round(coords[1][0] * _E5)), int(round((48.1 + lat_off) * _E5)))
+        return (a, b, 1.0, 'path', ())
+
+    near = [seg(10 / 110574.0)]
+    matches = _match_samples(samples, near, _build_segment_index(near))
+    assert all(m[0] == 0 for m in matches)
+    assert all(0.008 < m[1] < 0.012 for m in matches)
+
+    far = [seg(100 / 110574.0)]
+    matches = _match_samples(samples, far, _build_segment_index(far))
+    assert all(m[0] is None for m in matches)
+
+
+def test_gpx_upload_and_download(server):
+    doc = _gpx_doc(_grid_track(48.15, 11.52, 11.56), name='Upload &amp; Co')
+    resp = httpx.post(BASE + '/v1/gpx', content=doc.encode(),
+                      headers={'content-type': 'application/gpx+xml'}, timeout=30.0)
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert GpxStore.valid_id(body['gpx_id'])
+    assert body['name'] == 'Upload & Co'  # parser unescapes
+    assert body['points'] == len(_grid_track(48.15, 11.52, 11.56))
+    assert body['has_elevation'] is False
+    assert body['gpx_url'].endswith('/v1/gpx/%s.gpx' % body['gpx_id'])
+    # stored verbatim
+    down = httpx.get(body['gpx_url'], timeout=30.0)
+    assert down.status_code == 200
+    assert down.text == doc
+
+    # multipart works too
+    resp = httpx.post(BASE + '/v1/gpx', files={'file': ('t.gpx', doc.encode(), 'application/gpx+xml')},
+                      timeout=30.0)
+    assert resp.status_code == 201
+
+    # rejections
+    assert httpx.post(BASE + '/v1/gpx', content=b'', timeout=30.0).status_code == 400
+    resp = httpx.post(BASE + '/v1/gpx', content=b'<html/>', timeout=30.0)
+    assert resp.status_code == 400 and 'error' in resp.json()
+    assert httpx.get(BASE + '/v1/gpx').status_code == 405
+
+
+def test_gpx_upload_size_limit(server):
+    # ~11 MB of padding inside an otherwise valid document
+    doc = _gpx_doc(_grid_track(48.15, 11.52, 11.53)).replace(
+        '</gpx>', '<!--%s--></gpx>' % ('x' * (11 * 1024 * 1024)))
+    resp = httpx.post(BASE + '/v1/gpx', content=doc.encode(), timeout=60.0)
+    assert resp.status_code == 413
+
+
+def test_capabilities_advertise_gpx_upload(server):
+    caps = httpx.get(BASE + '/v1/capabilities', timeout=30.0).json()
+    assert caps['gpx_upload'] is True
+    assert caps['gpx_max_upload_bytes'] == 10 * 1024 * 1024
+    assert 'analyze_gpx' in caps['mcp_tools']
+
+
+def _upload(doc):
+    resp = httpx.post(BASE + '/v1/gpx', content=doc.encode(), timeout=30.0)
+    assert resp.status_code == 201, resp.text
+    return resp.json()['gpx_id']
+
+
+def test_analyze_gpx_on_network_track(server):
+    # along the lat=48.15 path row, then south along a track column
+    pts = _grid_track(48.15, 11.52, 11.56)
+    lat = 48.15
+    while lat > 48.13 - 1e-9:
+        lat -= 0.0005
+        pts.append((round(lat, 6), 11.56))
+    gpx_id = _upload(_gpx_doc(pts, name='Rasterrunde'))
+
+    body, is_error = call_tool('analyze_gpx', {'gpx_id': gpx_id})
+    assert not is_error, body
+    assert body['name'] == 'Rasterrunde'
+    assert body['gpx_id'] == gpx_id
+    assert body['gpx_url'].endswith('.gpx')
+    assert body['profile'] == 'foot'
+    assert body['points'] == len(pts)
+    assert 5.0 < body['distance_km'] < 5.5
+    assert body['matched_percent'] >= 97
+    assert body['off_network_km'] < 0.2
+    assert 'off_network_sections' not in body
+    assert set(body['road_classes_km']) == {'path', 'track'}
+    assert body['road_classes_km']['path'] > body['road_classes_km']['track']
+    assert abs(sum(body['road_classes_km'].values()) - body['distance_km']) < 0.2
+
+    # fixture has no sac_scale -> honest about it
+    assert 'sac_scale_data' in body
+    assert body['warnings'] == [pytest.approx(body['warnings'][0])]
+    assert 'MISSING DATA' in body['warnings'][0]
+    assert body['terrain_warnings'] == []
+
+    # no <ele> in the gpx -> contours; elevation rises 10 m per 0.001 deg lon
+    assert body['elevation_source'] == 'contours'
+    assert 380 <= body['ascent_m'] <= 420
+    assert body['descent_m'] == 0
+    assert body['duration_min'] > body['distance_km'] / 4.5 * 60  # ascent adds time
+    assert 'DIN 33466' in body['duration_note']
+
+    # POIs: Testhuette (tile centre) and Testmarkt in every tile of the corridor
+    assert body['poi_max_off_km'] == 1.0
+    summary = body['poi_summary']
+    assert summary['alpine_hut']['count'] >= 1
+    assert summary['supermarket']['count'] >= 1
+    assert summary['drinking_water']['count'] == 0
+    assert abs(summary['drinking_water']['max_gap_km'] - body['distance_km']) < 0.1
+    assert summary['alpine_hut']['max_gap_km'] <= body['distance_km']
+    huts = [p for p in body['pois'] if p['category'] == 'alpine_hut']
+    assert huts and all(p['name'] == 'Testhuette' for p in huts)
+    assert all(0 <= p['off_track_m'] <= 1000 for p in body['pois'])
+    assert all(0 <= p['at_km'] <= body['distance_km'] for p in body['pois'])
+    assert body['pois'] == sorted(body['pois'], key=lambda p: p['at_km'])
+    assert len(body['pois']) <= 60
+
+    # no geometry in the result
+    assert 'coordinates' not in body and 'geometry' not in body
+
+
+def test_analyze_gpx_detects_off_network_sections(server):
+    # a diagonal across the raster touches ways only at the crossings
+    pts = [(48.12 + i * 0.0004, 11.52 + i * 0.0006) for i in range(60)]
+    gpx_id = _upload(_gpx_doc(pts, name='Querfeldein'))
+    body, is_error = call_tool('analyze_gpx', {'gpx_id': gpx_id})
+    assert not is_error, body
+    assert body['matched_percent'] < 50
+    assert body['off_network_km'] > body['distance_km'] / 2
+    assert body['off_network_sections']
+    worst = body['off_network_sections'][0]
+    assert worst['length_km'] >= 0.1
+    assert worst['from_km'] < worst['to_km']
+    assert any('from any mapped way' in w for w in body['terrain_warnings'])
+
+
+def test_analyze_gpx_prefers_gpx_elevation(server):
+    pts = _grid_track(48.15, 11.52, 11.54)
+    # barometer says: 100 m up then 40 m down, regardless of what contours say
+    n = len(pts)
+    ele = [1000 + i * (100.0 / (n // 2)) for i in range(n // 2)]
+    ele += [1100 - (i + 1) * (40.0 / (n - n // 2)) for i in range(n - n // 2)]
+    gpx_id = _upload(_gpx_doc(pts, ele=ele))
+
+    body, is_error = call_tool('analyze_gpx', {'gpx_id': gpx_id})
+    assert not is_error, body
+    assert body['elevation_source'] == 'gpx'
+    assert 95 <= body['ascent_m'] <= 105
+    assert 35 <= body['descent_m'] <= 45
+    assert body['min_ele_m'] == 1000 and 1095 <= body['max_ele_m'] <= 1100
+    assert 'hysteresis' in body['elevation_note']
+
+    # explicit cross-check against contours
+    body, is_error = call_tool('analyze_gpx', {'gpx_id': gpx_id, 'elevation_source': 'contours'})
+    assert not is_error, body
+    assert body['elevation_source'] == 'contours'
+    assert 180 <= body['ascent_m'] <= 220  # 0.02 deg lon * 10 m / 0.001
+
+    # gpx forced on a track without <ele> is an error, not a silent fallback
+    bare = _upload(_gpx_doc(pts))
+    body, is_error = call_tool('analyze_gpx', {'gpx_id': bare, 'elevation_source': 'gpx'})
+    assert is_error and '<ele>' in body['error']
+
+
+def test_analyze_gpx_poi_options(server):
+    gpx_id = _upload(_gpx_doc(_grid_track(48.15, 11.52, 11.55)))
+
+    body, is_error = call_tool('analyze_gpx', {
+        'gpx_id': gpx_id, 'poi_categories': ['supermarket'], 'poi_max_off_km': 0.3,
+        'profile': 'bike',
+    })
+    assert not is_error, body
+    assert list(body['poi_summary']) == ['supermarket']
+    assert all(p['category'] == 'supermarket' for p in body['pois'])
+    assert all(p['off_track_m'] <= 300 for p in body['pois'])
+    assert body['poi_max_off_km'] == 0.3
+    assert body['profile'] == 'bike'
+    assert 'flat-speed' in body['duration_note']
+
+    body, is_error = call_tool('analyze_gpx', {'gpx_id': gpx_id, 'poi_categories': ['biergarten']})
+    assert is_error and 'unknown poi category' in body['error']
+    body, is_error = call_tool('analyze_gpx', {'gpx_id': gpx_id, 'profile': 'car'})
+    assert is_error and 'unknown profile' in body['error']
+
+
+def test_analyze_gpx_errors(server):
+    body, is_error = call_tool('analyze_gpx', {'gpx_id': 'deadbeefdeadbeef'})
+    assert is_error and 'unknown or expired' in body['error']
+    body, is_error = call_tool('analyze_gpx', {'gpx_id': '../etc/passwd'})
+    assert is_error
+    body, is_error = call_tool('analyze_gpx', {})
+    assert is_error
+    body, is_error = call_tool('analyze_gpx', {'gpx_id': 'deadbeefdeadbeef', 'tileset': 'nope@1'})
+    assert is_error and 'unknown tileset' in body['error']
+
+
+def test_analyze_gpx_accepts_plan_route_output(server):
+    planned, is_error = call_tool('plan_route', {
+        'waypoints': [[48.12, 11.52], [48.15, 11.56]], 'name': 'geplant',
+    })
+    assert not is_error, planned
+    body, is_error = call_tool('analyze_gpx', {'gpx_id': planned['gpx_id']})
+    assert not is_error, body
+    assert body['name'] == 'geplant'
+    assert body['matched_percent'] >= 95  # it *is* the network
+    assert abs(body['distance_km'] - planned['distance_km']) < 0.1
+
+
+def test_gpx_analysis_rest_endpoint(server):
+    gpx_id = _upload(_gpx_doc(_grid_track(48.15, 11.52, 11.54)))
+    resp = httpx.get(BASE + '/v1/gpx/%s/analysis' % gpx_id,
+                     params={'poi_categories': 'alpine_hut,supermarket', 'poi_max_off_km': 0.5},
+                     timeout=60.0)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body['gpx_id'] == gpx_id
+    assert set(body['poi_summary']) == {'alpine_hut', 'supermarket'}
+    assert resp.headers['cache-control'] == 'no-store'
+
+    assert httpx.get(BASE + '/v1/gpx/deadbeefdeadbeef/analysis').status_code == 404
+    assert httpx.get(BASE + '/v1/gpx/%s/analysis' % gpx_id,
+                     params={'tileset': 'nope'}).status_code == 400
+    assert httpx.get(BASE + '/v1/gpx/%s/analysis' % gpx_id,
+                     params={'poi_max_off_km': 'x'}).status_code == 400
+
+
+def test_analyze_gpx_tool_description(server):
+    tools = {t['name']: t for t in rpc('tools/list').json()['result']['tools']}
+    tool = tools['analyze_gpx']
+    for term in ('POST /v1/gpx', 'off_network', 'max_gap_km', 'MISSING DATA'):
+        assert term in tool['description']
+    props = tool['inputSchema']['properties']
+    assert tool['inputSchema']['required'] == ['gpx_id']
+    assert props['elevation_source']['enum'] == ['auto', 'gpx', 'contours']
+    assert 'drinking_water' in props['poi_categories']['items']['enum']
+
+
+def test_terrain_warnings_from_hits_reports_km_position():
+    from simple_mbtiles_server.__main__ import _terrain_warnings_from_hits
+
+    hits = [
+        (47.1, 11.1, {'sac_scale': 'mountain_hiking', 'surface': 'gravel'}, 1.0),
+        (47.2, 11.2, {'sac_scale': 'alpine_hiking', 'osm_id': 42}, 8.25),
+        (47.3, 11.3, {'via_ferrata_scale': '2', 'osm_id': 7}, 12.0),
+        (47.3, 11.3, {'via_ferrata_scale': '2', 'osm_id': 7}, 12.02),
+        (47.4, 11.4, {'trail_visibility': 'bad'}, 15.0),
+    ]
+    warnings, stats = _terrain_warnings_from_hits(hits)
+    assert stats['max_sac_scale'] == 'T4'
+    assert stats['via_ferrata_sections'] == 2
+    assert stats['surface_segments'] == {'gravel': 1}
+    assert warnings[0].startswith('VIA FERRATA at km 12.0')
+    assert '2 segments' in warnings[0] and 'way/7' in warnings[0]
+    assert 'T4 = alpine_hiking at km 8.2' in warnings[1]
+    assert 'trail_visibility=bad at km 15.0' in warnings[2]
+
+    # without a distance axis the old phrasing is kept
+    warnings, _ = _terrain_warnings_from_hits([(47.1, 11.1, {'sac_scale': 'hiking'}, None)])
+    assert 'near 47.10000,11.10000' in warnings[0]

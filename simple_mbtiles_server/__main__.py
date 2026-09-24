@@ -36,7 +36,7 @@ from werkzeug.middleware.proxy_fix import (
 )
 
 from .glyphs_pb2 import glyphs
-from .gpx import GpxStore, to_gpx
+from .gpx import GpxError, GpxStore, gpx_ascent_descent, parse_gpx, to_gpx
 from .mcp import MCPServer, ToolError
 
 
@@ -1424,8 +1424,16 @@ def _routes_along_path(path_coords, edge_routes, min_edges=2, walkable_only=True
         for entry in edge_routes.get((a, b) if a < b else (b, a), ()):
             counts[entry] = counts.get(entry, 0) + 1
 
+    return _route_report(counts, len(path_coords) - 1, min_edges, walkable_only)
+
+
+def _route_report(counts, total, min_edges=2, walkable_only=True):
+    """
+    Turn {(network, ref, name): count} into the routes list of a result.
+    *total* is the number of units (edges or samples) the counts refer to.
+    """
     out = []
-    total = max(1, len(path_coords) - 1)
+    total = max(1, total)
     for (network, ref, name), count in sorted(
         counts.items(), key=lambda kv: kv[1], reverse=True
     ):
@@ -1527,11 +1535,7 @@ def _terrain_warnings(path_coords, edge_hints):
     Returns (warnings, stats).  Only reports what is actually tagged -- the
     data is far too sparse to conclude a path is harmless from silence.
     """
-    surfaces = {}
-    steep = []
-    sac_hits = {}
-    ferrata = []
-    poor_visibility = []
+    hits = []
     for i in range(len(path_coords) - 1):
         a = (int(round(path_coords[i][0] * _E5)), int(round(path_coords[i][1] * _E5)))
         b = (
@@ -1542,8 +1546,34 @@ def _terrain_warnings(path_coords, edge_hints):
         entry = edge_hints.get(key)
         if not entry:
             continue
-        _road_class, hints = entry
-        hint = dict(hints)
+        hits.append((path_coords[i][1], path_coords[i][0], dict(entry[1]), None))
+    return _terrain_warnings_from_hits(hits)
+
+
+def _where(lat, lon, at_km):
+    """Position phrase for a warning: 'km 8.2 (47.12345,11.12345)' or just
+    the coordinate when the path has no distance axis."""
+    if at_km is None:
+        return "near %.5f,%.5f" % (lat, lon)
+    return "at km %.1f (%.5f,%.5f)" % (at_km, lat, lon)
+
+
+def _terrain_warnings_from_hits(hits):
+    """
+    Warnings and stats from a list of (lat, lon, hint_dict, at_km_or_None).
+
+    Shared by routing (hits are graph edges) and GPX analysis (hits are
+    map-matched samples).  Only reports what is actually tagged -- the data
+    is far too sparse to conclude a path is harmless from silence.
+    """
+    surfaces = {}
+    steep = []
+    sac_hits = {}
+    ferrata = []
+    poor_visibility = []
+    for lat, lon, hint, at_km in hits:
+        lat = round(lat, 5)
+        lon = round(lon, 5)
         if "surface" in hint:
             surfaces[hint["surface"]] = surfaces.get(hint["surface"], 0) + 1
 
@@ -1551,36 +1581,25 @@ def _terrain_warnings(path_coords, edge_hints):
         # every heuristic; where absent nothing can be concluded.
         sac = hint.get("sac_scale")
         if sac in _SAC_SCALE_RANK and sac not in sac_hits:
-            sac_hits[sac] = (
-                round(path_coords[i][1], 5),
-                round(path_coords[i][0], 5),
-                hint.get("osm_id"),
-            )
+            sac_hits[sac] = (lat, lon, hint.get("osm_id"), at_km)
         if hint.get("via_ferrata_scale") or hint.get("ladder") in ("yes", "1"):
             ferrata.append(
                 (
-                    round(path_coords[i][1], 5),
-                    round(path_coords[i][0], 5),
+                    lat,
+                    lon,
                     hint.get("via_ferrata_scale") or "ladder",
                     hint.get("osm_id"),
+                    at_km,
                 )
             )
         vis = hint.get("trail_visibility")
         if vis in _POOR_VISIBILITY and vis not in [v[2] for v in poor_visibility]:
-            poor_visibility.append(
-                (round(path_coords[i][1], 5), round(path_coords[i][0], 5), vis)
-            )
+            poor_visibility.append((lat, lon, vis, at_km))
         scale = hint.get("mtb_scale")
         if scale is not None:
             try:
                 if int(scale) >= _MTB_SCALE_ALERT:
-                    steep.append(
-                        (
-                            round(path_coords[i][1], 5),
-                            round(path_coords[i][0], 5),
-                            int(scale),
-                        )
-                    )
+                    steep.append((lat, lon, int(scale), at_km))
             except (TypeError, ValueError):
                 pass
 
@@ -1591,14 +1610,13 @@ def _terrain_warnings(path_coords, edge_hints):
     # identical lines: on a Zugspitze route that was 36 segments.
     if ferrata:
         by_way = {}
-        for lat, lon, scale, osm_id in ferrata:
+        for lat, lon, scale, osm_id, at_km in ferrata:
             key = osm_id or ("%.3f,%.3f" % (lat, lon))
             if key not in by_way:
-                by_way[key] = (lat, lon, scale, osm_id, 0)
-            prev = by_way[key]
-            by_way[key] = (prev[0], prev[1], prev[2], prev[3], prev[4] + 1)
+                by_way[key] = [lat, lon, scale, osm_id, at_km, 0]
+            by_way[key][5] += 1
 
-        for lat, lon, scale, osm_id, count in list(by_way.values())[:5]:
+        for lat, lon, scale, osm_id, at_km, count in list(by_way.values())[:5]:
             source = (
                 (" https://www.openstreetmap.org/way/%s" % osm_id) if osm_id else ""
             )
@@ -1608,9 +1626,15 @@ def _terrain_warnings(path_coords, edge_hints):
                 else "fixed ladders"
             )
             warnings.append(
-                "VIA FERRATA near %.5f,%.5f (%s, %d segment%s). Requires a "
+                "VIA FERRATA %s (%s, %d segment%s). Requires a "
                 "harness, a via ferrata set and the skills to use them.%s"
-                % (lat, lon, grade, count, "" if count == 1 else "s", source)
+                % (
+                    _where(lat, lon, at_km),
+                    grade,
+                    count,
+                    "" if count == 1 else "s",
+                    source,
+                )
             )
         if len(by_way) > 5:
             warnings.append(
@@ -1620,28 +1644,34 @@ def _terrain_warnings(path_coords, edge_hints):
 
     if sac_hits:
         hardest = max(sac_hits, key=lambda k: _SAC_SCALE_RANK[k])
-        lat, lon, osm_id = sac_hits[hardest]
+        lat, lon, osm_id, at_km = sac_hits[hardest]
         grades = ", ".join(
             "%s (%s)" % (_SAC_SCALE_LABEL[k], k)
             for k in sorted(sac_hits, key=lambda k: _SAC_SCALE_RANK[k])
         )
         source = (" https://www.openstreetmap.org/way/%s" % osm_id) if osm_id else ""
         warnings.append(
-            "hardest section on this route is %s = %s near %.5f,%.5f; "
+            "hardest section on this route is %s = %s %s; "
             "grades along the way: %s%s"
-            % (_SAC_SCALE_LABEL[hardest], hardest, lat, lon, grades, source)
+            % (
+                _SAC_SCALE_LABEL[hardest],
+                hardest,
+                _where(lat, lon, at_km),
+                grades,
+                source,
+            )
         )
 
-    for lat, lon, vis in poor_visibility[:3]:
+    for lat, lon, vis, at_km in poor_visibility[:3]:
         warnings.append(
-            "trail_visibility=%s near %.5f,%.5f -- the path may be hard or "
-            "impossible to follow on the ground" % (vis, lat, lon)
+            "trail_visibility=%s %s -- the path may be hard or "
+            "impossible to follow on the ground" % (vis, _where(lat, lon, at_km))
         )
 
-    for lat, lon, scale in steep[:5]:
+    for lat, lon, scale, at_km in steep[:5]:
         warnings.append(
-            "mtb_scale=%d tagged near %.5f,%.5f -- expert MTB terrain, on foot "
-            "usually steep and rocky" % (scale, lat, lon)
+            "mtb_scale=%d tagged %s -- expert MTB terrain, on foot "
+            "usually steep and rocky" % (scale, _where(lat, lon, at_km))
         )
 
     stats = {}
@@ -1660,6 +1690,135 @@ def _terrain_warnings(path_coords, edge_hints):
     if ferrata:
         stats["via_ferrata_sections"] = len(ferrata)
     return warnings, stats
+
+
+# ---------------------------------------------------------------------------
+# GPX analysis: map-matching a foreign track onto the tile network
+# ---------------------------------------------------------------------------
+
+# A recorded track never sits on graph nodes, so the graph-edge lookups above
+# do not apply.  Instead the track is resampled at a fixed step and every
+# sample is matched to the nearest decoded segment within a tolerance.
+_GPX_SAMPLE_KM = 0.02  # 20 m between samples; shares are length weighted
+_GPX_MATCH_TOLERANCE_KM = 0.03  # GPS error (5-15 m) + tile simplification
+_GPX_MATCH_CELL = 0.002  # ~200 m grid, same as the route index
+_GPX_ELE_HYSTERESIS_M = 10.0
+_GPX_POI_DEFAULT_CATEGORIES = (
+    "alpine_hut",
+    "shelter",
+    "camp_site",
+    "drinking_water",
+    "supermarket",
+    "emergency",
+)
+_GPX_POI_PER_CATEGORY = 15
+_GPX_POI_TOTAL = 60
+
+
+def _resample_path(coords, step_km=_GPX_SAMPLE_KM):
+    """
+    Resample a [lon, lat, ...] polyline at *step_km* intervals.
+
+    Returns (samples, total_km) where samples are (lon, lat, cum_km).  The
+    original vertices are not kept: a GPS track logs a point every second
+    when standing still and every 50 m when running, so anything counted
+    per point would be weighted by recording rate rather than by distance.
+    """
+    if not coords:
+        return [], 0.0
+    samples = [(coords[0][0], coords[0][1], 0.0)]
+    cum = 0.0
+    carry = 0.0  # distance already walked into the current segment
+    for i in range(len(coords) - 1):
+        ax, ay = coords[i][0], coords[i][1]
+        bx, by = coords[i + 1][0], coords[i + 1][1]
+        seg = _haversine(ax, ay, bx, by)
+        if seg <= 0.0:
+            continue
+        pos = step_km - carry
+        while pos <= seg:
+            t = pos / seg
+            samples.append((ax + (bx - ax) * t, ay + (by - ay) * t, cum + pos))
+            pos += step_km
+        carry = seg - (pos - step_km)
+        cum += seg
+    if samples[-1][2] < cum:
+        samples.append((coords[-1][0], coords[-1][1], cum))
+    return samples, cum
+
+
+def _build_segment_index(segments, cell=_GPX_MATCH_CELL):
+    """
+    Grid index over decoded road segments: cell -> [segment index, ...].
+    A segment is booked into every cell its bounding box touches; segments
+    are short (tile geometry is dense) so that is one or two cells each.
+    """
+    index = {}
+    for i, segment in enumerate(segments):
+        (ax, ay), (bx, by) = segment[0], segment[1]
+        ax /= _E5
+        ay /= _E5
+        bx /= _E5
+        by /= _E5
+        for cx in range(int(min(ax, bx) / cell), int(max(ax, bx) / cell) + 1):
+            for cy in range(int(min(ay, by) / cell), int(max(ay, by) / cell) + 1):
+                index.setdefault((cx, cy), []).append(i)
+    return index
+
+
+def _match_samples(samples, segments, index, tolerance_km=_GPX_MATCH_TOLERANCE_KM):
+    """
+    Nearest segment for every sample, or None when nothing is within
+    *tolerance_km*.  Returns a list parallel to *samples* of
+    (segment_index_or_None, distance_km).
+
+    Distances are equirectangular in km (good to well under a metre at 30 m
+    scale); haversine is not needed for a nearest-of-few decision.
+    """
+    if not samples:
+        return []
+    cell = _GPX_MATCH_CELL
+    kx_cache = {}
+    out = []
+    for lon, lat, _cum in samples:
+        # km per degree at this latitude, cached per 0.01 deg band
+        band = int(lat * 100)
+        kx = kx_cache.get(band)
+        if kx is None:
+            kx = 111.32 * math.cos(math.radians(lat))
+            kx_cache[band] = kx
+        best = None
+        best_d = tolerance_km
+        cx = int(lon / cell)
+        cy = int(lat / cell)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for si in index.get((cx + dx, cy + dy), ()):
+                    (ax, ay), (bx, by) = segments[si][0], segments[si][1]
+                    d = _point_segment_distance(
+                        lon * kx,
+                        lat * 110.574,
+                        ax / _E5 * kx,
+                        ay / _E5 * 110.574,
+                        bx / _E5 * kx,
+                        by / _E5 * 110.574,
+                    )
+                    if d < best_d:
+                        best_d = d
+                        best = si
+        out.append((best, best_d if best is not None else None))
+    return out
+
+
+def _gaps_km(positions_km, total_km):
+    """Longest stretch without a hit, counting start and end of the track."""
+    if not positions_km:
+        return total_km
+    ordered = sorted(positions_km)
+    longest = max(ordered[0], total_km - ordered[-1])
+    for i in range(len(ordered) - 1):
+        longest = max(longest, ordered[i + 1] - ordered[i])
+    return longest
 
 
 def _nearest_node(graph, lon, lat, candidates=None):
@@ -1905,6 +2064,7 @@ def simple_mbtiles_server(
     gpx_dir=None,
     gpx_max_files=200,
     gpx_ttl_seconds=86400,
+    gpx_max_upload_bytes=10 * 1024 * 1024,
     route_max_tiles=1200,
     route_max_crow_km=50.0,
 ):
@@ -2085,6 +2245,9 @@ def simple_mbtiles_server(
     app.wsgi_app = ProxyFix(
         app.wsgi_app, x_proto=1, x_for=0, x_host=0, x_port=0, x_prefix=0
     )
+    # GPX uploads are the only large request body; MCP/elevation payloads are
+    # far below this. Werkzeug answers 413 on its own when exceeded.
+    app.config["MAX_CONTENT_LENGTH"] = gpx_max_upload_bytes
 
     sql = """
         SELECT
@@ -2827,6 +2990,348 @@ def simple_mbtiles_server(
             features = features[: int(limit)]
         return features
 
+    def _poi_along_samples(identifier, version, tiles, samples, categories, max_off_km):
+        """
+        POIs of *categories* within *max_off_km* of the resampled track.
+        Returns (pois, summary) -- pois sorted by position on the track, capped
+        per category and in total; summary has count and longest gap per
+        category (start and end of the track count as gaps, so a hut 3 km
+        after the start still yields max_gap_km = 3).
+        """
+        db_connection = mbtiles_dict[(identifier, version)]["db_connection"]
+        total_km = samples[-1][2] if samples else 0.0
+
+        # grid over the samples so each POI checks a few dozen, not all
+        cell = _GPX_MATCH_CELL
+        grid = {}
+        for lon, lat, cum in samples:
+            grid.setdefault((int(lon / cell), int(lat / cell)), []).append(
+                (lon, lat, cum)
+            )
+        reach = int(math.ceil(max_off_km / (cell * 111.0))) + 1
+
+        seen = set()
+        found = {c: [] for c in categories}
+        for z, x, y in tiles:
+            key = ("poi", identifier, version, z, x, y)
+            cached = poi_cache.get(key)
+            if cached is None:
+                blob = _load_tile_blob(db_connection, z, x, y)
+                cached = _parse_mvt_poi(blob, x, y, z, None) if blob else []
+                poi_cache.put(key, cached)
+            for f in cached:
+                props = f["properties"]
+                category = None
+                for c in categories:
+                    if _matches_poi_category(props, c):
+                        category = c
+                        break
+                if category is None:
+                    continue
+                plon, plat = f["geometry"]["coordinates"]
+                dedupe_key = (round(plon, 6), round(plat, 6))
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+
+                best_km = None
+                best_at = None
+                cx = int(plon / cell)
+                cy = int(plat / cell)
+                for dx in range(-reach, reach + 1):
+                    for dy in range(-reach, reach + 1):
+                        for slon, slat, cum in grid.get((cx + dx, cy + dy), ()):
+                            d = _haversine(plon, plat, slon, slat)
+                            if best_km is None or d < best_km:
+                                best_km = d
+                                best_at = cum
+                if best_km is None or best_km > max_off_km:
+                    continue
+                item = {
+                    "name": _poi_name(props) or None,
+                    "lat": round(plat, 5),
+                    "lon": round(plon, 5),
+                    "category": category,
+                    "type": props.get("subclass") or props.get("class"),
+                    "at_km": round(best_at, 1),
+                    "off_track_m": int(round(best_km * 1000)),
+                }
+                found[category].append(item)
+
+        pois = []
+        summary = {}
+        for category in categories:
+            items = sorted(found[category], key=lambda p: p["at_km"])
+            if not items:
+                summary[category] = {"count": 0, "max_gap_km": round(total_km, 1)}
+                continue
+            summary[category] = {
+                "count": len(items),
+                "max_gap_km": round(_gaps_km([p["at_km"] for p in items], total_km), 1),
+            }
+            if len(items) > _GPX_POI_PER_CATEGORY:
+                # keep the named ones, then spread the rest along the track
+                items.sort(key=lambda p: (0 if p["name"] else 1, p["at_km"]))
+                items = sorted(items[:_GPX_POI_PER_CATEGORY], key=lambda p: p["at_km"])
+                summary[category]["truncated"] = True
+            pois.extend(items)
+        pois.sort(key=lambda p: p["at_km"])
+        if len(pois) > _GPX_POI_TOTAL:
+            pois = pois[:_GPX_POI_TOTAL]
+        return pois, summary
+
+    def analyze_gpx(
+        identifier,
+        version,
+        points,
+        profile="foot",
+        poi_categories=None,
+        poi_max_off_km=1.0,
+        elevation_source="auto",
+    ):
+        """
+        Assess a foreign track (list of [lon, lat, ele_or_None]) against the
+        tile network: which way classes and surfaces it uses, how much of it
+        runs off any mapped way, tagged difficulty, marked routes, elevation
+        and POIs along the corridor.  Raises RoutingError on expected failure.
+        """
+        if profile not in _ROUTING_PROFILES:
+            raise RoutingError('unknown profile "%s"; use foot or bike' % profile, 400)
+        if (identifier, version) not in mbtiles_dict:
+            raise RoutingError("unknown tileset %s@%s" % (identifier, version), 404)
+        if elevation_source not in ("auto", "gpx", "contours"):
+            raise RoutingError(
+                'unknown elevation_source "%s"; use auto, gpx or contours'
+                % elevation_source,
+                400,
+            )
+        categories = list(poi_categories or _GPX_POI_DEFAULT_CATEGORIES)
+        for c in categories:
+            if c not in _POI_CATEGORY_FILTERS:
+                raise RoutingError(
+                    'unknown poi category "%s"; available: %s'
+                    % (c, ", ".join(sorted(_POI_CATEGORY_FILTERS))),
+                    400,
+                )
+        poi_max_off_km = min(max(float(poi_max_off_km), 0.1), 5.0)
+        if len(points) < 2:
+            raise RoutingError("track needs at least two points", 400)
+
+        coords = [[p[0], p[1]] for p in points]
+        samples, total_km = _resample_path(coords)
+        if total_km <= 0.0:
+            raise RoutingError("track has zero length", 400)
+
+        # Tiles: the POI corridor decides the width; roads only need the
+        # track itself, but one tile set keeps the cache footprint small.
+        zoom = 14
+        tile_km = _tile_width_km(coords[0][1], zoom)
+        buffer_tiles = max(0.5, poi_max_off_km / max(tile_km, 0.001))
+        # thin the track before corridor building; 20 m samples are overkill
+        # for a tile-sized corridor and _tiles_along_line is per segment
+        thin = [[s[0], s[1]] for s in samples[:: max(1, len(samples) // 400)]]
+        if thin[-1] != [samples[-1][0], samples[-1][1]]:
+            thin.append([samples[-1][0], samples[-1][1]])
+        tiles = _tiles_along_path(thin, zoom, buffer_tiles=buffer_tiles)
+        if len(tiles) > route_max_tiles:
+            raise RoutingError(
+                "track corridor too large (%d tiles, limit %d); split the track "
+                "or reduce poi_max_off_km" % (len(tiles), route_max_tiles),
+                400,
+            )
+
+        segments, named_ways, route_ways, hits, misses = _road_segments_for_tiles(
+            identifier, version, tiles
+        )
+
+        # --- map matching ------------------------------------------------
+        index = _build_segment_index(segments)
+        matches = _match_samples(samples, segments, index)
+        step_km = total_km / max(1, len(samples) - 1)
+
+        class_km = {}
+        surface_km = {}
+        off_km = 0.0
+        off_runs = []  # (start_km, end_km) of consecutive unmatched samples
+        run_start = None
+        terrain_hits = []
+        route_counts = {}
+        route_index = _build_route_index(route_ways) if route_ways else None
+        tagged_indices = set()  # sample indices with real difficulty data
+        for i, ((si, _d), (lon, lat, cum)) in enumerate(zip(matches, samples)):
+            if si is None:
+                off_km += step_km
+                if run_start is None:
+                    run_start = cum
+                continue
+            if run_start is not None:
+                off_runs.append((run_start, cum))
+                run_start = None
+            segment = segments[si]
+            road_class = segment[3]
+            class_km[road_class] = class_km.get(road_class, 0.0) + step_km
+            hint = dict(segment[4]) if len(segment) > 4 and segment[4] else {}
+            if hint:
+                terrain_hits.append((lat, lon, hint, cum))
+                if hint.get("surface"):
+                    surface_km[hint["surface"]] = (
+                        surface_km.get(hint["surface"], 0.0) + step_km
+                    )
+                if (
+                    hint.get("sac_scale")
+                    or hint.get("via_ferrata_scale")
+                    or hint.get("ladder")
+                ):
+                    tagged_indices.add(i)
+            if route_index is not None:
+                for entry in _routes_at(route_index, lon, lat):
+                    route_counts[entry] = route_counts.get(entry, 0) + 1
+        if run_start is not None:
+            off_runs.append((run_start, samples[-1][2]))
+
+        result = {
+            "profile": profile,
+            "distance_km": round(total_km, 2),
+            "points": len(points),
+            "samples": len(samples),
+            "tiles_loaded": len(tiles),
+            "cache_hits": hits,
+            "cache_misses": misses,
+            "matched_percent": round(100.0 * (1.0 - off_km / total_km)),
+            "off_network_km": round(off_km, 2),
+            "road_classes_km": {
+                k: round(v, 2)
+                for k, v in sorted(class_km.items(), key=lambda kv: -kv[1])
+            },
+        }
+        if surface_km:
+            result["surface_km"] = {
+                k: round(v, 2)
+                for k, v in sorted(surface_km.items(), key=lambda kv: -kv[1])
+            }
+        # longest off-network stretches, worst first
+        off_runs = [(a, b) for a, b in off_runs if b - a >= 0.1]
+        if off_runs:
+            off_runs.sort(key=lambda r: r[0] - r[1])
+            result["off_network_sections"] = [
+                {
+                    "from_km": round(a, 1),
+                    "to_km": round(b, 1),
+                    "length_km": round(b - a, 2),
+                }
+                for a, b in off_runs[:10]
+            ]
+
+        warnings = []
+        if off_km / total_km > 0.1:
+            warnings.append(
+                "%.0f %% of the track (%.1f km) runs more than %d m from any mapped "
+                "way -- either pathless terrain (alpine, glacier, ford) or ways "
+                "missing in the tiles. Treat these sections as unknown difficulty "
+                "and check them on a topographic map."
+                % (100.0 * off_km / total_km, off_km, _GPX_MATCH_TOLERANCE_KM * 1000)
+            )
+        terrain_warnings, terrain_stats = _terrain_warnings_from_hits(terrain_hits)
+        warnings.extend(terrain_warnings)
+        warnings.extend(
+            _named_way_warnings(
+                [[s[0], s[1]] for s in samples],
+                named_ways,
+                tagged_indices=tagged_indices,
+            )
+        )
+        if warnings:
+            result["terrain_warnings"] = warnings
+        for k in (
+            "sac_scale",
+            "max_sac_scale",
+            "via_ferrata_sections",
+            "mtb_scale_alerts",
+        ):
+            if k in terrain_stats:
+                result[k] = terrain_stats[k]
+        if "sac_scale" not in terrain_stats:
+            result["sac_scale_data"] = (
+                "no sac_scale tagged along this track -- difficulty unknown, "
+                "not necessarily easy"
+            )
+        if route_counts:
+            routes = _route_report(route_counts, len(samples))
+            if routes:
+                result["routes"] = routes
+
+        # --- elevation ----------------------------------------------------
+        gpx_eles = [p[2] if len(p) > 2 else None for p in points]
+        with_ele = sum(1 for e in gpx_eles if e is not None)
+        ele_coverage = with_ele / float(len(points))
+        ascent = descent = None
+        if elevation_source == "gpx" and ele_coverage < 0.9:
+            raise RoutingError(
+                "elevation_source=gpx requested, but only %d %% of the track points "
+                "carry <ele>" % (ele_coverage * 100),
+                400,
+            )
+        use_gpx = elevation_source == "gpx" or (
+            elevation_source == "auto" and ele_coverage >= 0.9
+        )
+        if use_gpx:
+            ascent, descent = gpx_ascent_descent(gpx_eles, _GPX_ELE_HYSTERESIS_M)
+            known = [e for e in gpx_eles if e is not None]
+            result.update(
+                {
+                    "elevation_source": "gpx",
+                    "ascent_m": ascent,
+                    "descent_m": descent,
+                    "min_ele_m": int(round(min(known))),
+                    "max_ele_m": int(round(max(known))),
+                    "elevation_note": (
+                        "ascent/descent from the track's own <ele> values with a "
+                        "%d m hysteresis; barometric tracks are good, plain GPS "
+                        "elevation tends to overstate" % _GPX_ELE_HYSTERESIS_M
+                    ),
+                }
+            )
+        elif contours_dict:
+            try:
+                ascent, descent, _ = compute_elevation(
+                    [[s[0], s[1]] for s in samples[:: max(1, len(samples) // 4000)]]
+                )
+                result.update(
+                    {
+                        "elevation_source": "contours",
+                        "ascent_m": ascent,
+                        "descent_m": descent,
+                    }
+                )
+            except RoutingError as exc:
+                result["elevation_note"] = "contours unavailable: %s" % exc.message
+        else:
+            result["elevation_source"] = None
+            result["elevation_note"] = (
+                "no <ele> in the track and no contours on the server -- "
+                "duration is a flat-speed estimate"
+            )
+
+        result["duration_min"] = round(
+            _duration_min(profile, total_km, ascent, descent)
+        )
+        if profile == "foot" and ascent is not None:
+            result["duration_note"] = (
+                "DIN 33466 / SAC: 300 m ascent or 500 m descent per hour, "
+                "combined with the horizontal time"
+            )
+        else:
+            result["duration_note"] = "flat-speed estimate, no elevation applied"
+
+        # --- POIs -----------------------------------------------------------
+        pois, poi_summary = _poi_along_samples(
+            identifier, version, tiles, samples, categories, poi_max_off_km
+        )
+        result["poi_max_off_km"] = poi_max_off_km
+        result["poi_summary"] = poi_summary
+        result["pois"] = pois
+        return result
+
     # ------------------------------------------------------------------
     # REST endpoints
     # ------------------------------------------------------------------
@@ -2955,6 +3460,105 @@ def simple_mbtiles_server(
             },
         )
 
+    def post_gpx():
+        """
+        POST /v1/gpx -- upload a GPX file, get a gpx_id back.
+
+        Accepts the raw document as body (application/gpx+xml, text/xml,
+        application/xml, application/octet-stream) or a multipart form with a
+        "file" field.  The original XML is stored verbatim so the download is
+        byte-identical; only the parse result is validated here.
+        """
+        if request.content_length and request.content_length > gpx_max_upload_bytes:
+            return _json(
+                {"error": "gpx too large (limit %d bytes)" % gpx_max_upload_bytes}, 413
+            )
+        data = None
+        if request.files:
+            upload = request.files.get("file") or next(iter(request.files.values()))
+            data = upload.read(gpx_max_upload_bytes + 1)
+        else:
+            data = request.get_data(cache=False)
+        if not data:
+            return _json(
+                {
+                    "error": "empty upload; send the gpx as body or as multipart field 'file'"
+                },
+                400,
+            )
+        if len(data) > gpx_max_upload_bytes:
+            return _json(
+                {"error": "gpx too large (limit %d bytes)" % gpx_max_upload_bytes}, 413
+            )
+        try:
+            parsed = parse_gpx(data)
+        except GpxError as exc:
+            return _json({"error": str(exc)}, 400)
+        try:
+            xml = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return _json({"error": "gpx must be utf-8 encoded"}, 400)
+        gpx_id = gpx_store.write(xml)
+        return _json(
+            {
+                "gpx_id": gpx_id,
+                "gpx_url": _external_url("/v1/gpx/%s.gpx" % gpx_id),
+                "name": parsed["name"],
+                "points": len(parsed["points"]),
+                "waypoints": len(parsed["waypoints"]),
+                "has_elevation": any(p[2] is not None for p in parsed["points"]),
+            },
+            201,
+        )
+
+    def _load_gpx_points(gpx_id):
+        """Stored track for *gpx_id* as parse_gpx() output, or RoutingError."""
+        xml = gpx_store.read(gpx_id)
+        if xml is None:
+            raise RoutingError("unknown or expired gpx id", 404)
+        try:
+            return parse_gpx(xml)
+        except GpxError as exc:
+            raise RoutingError("stored gpx is not usable: %s" % exc, 400)
+
+    def get_gpx_analysis(gpx_id):
+        """
+        GET /v1/gpx/<id>/analysis?profile=&poi_categories=a,b&poi_max_off_km=&elevation_source=&tileset=
+        REST twin of the analyze_gpx MCP tool.
+        """
+        try:
+            parsed = _load_gpx_points(gpx_id)
+        except RoutingError as exc:
+            return _json({"error": exc.message}, exc.status)
+        tileset = request.args.get("tileset")
+        if tileset:
+            if "@" not in tileset:
+                return _json({"error": "tileset must be identifier@version"}, 400)
+            identifier, version = tileset.split("@", 1)
+        else:
+            identifier, version = default_tiles
+        categories = request.args.get("poi_categories")
+        categories = [c for c in categories.split(",") if c] if categories else None
+        try:
+            poi_max_off_km = float(request.args.get("poi_max_off_km", 1.0))
+        except ValueError:
+            return _json({"error": "poi_max_off_km must be a number"}, 400)
+        try:
+            result = analyze_gpx(
+                identifier,
+                version,
+                parsed["points"],
+                profile=request.args.get("profile", "foot"),
+                poi_categories=categories,
+                poi_max_off_km=poi_max_off_km,
+                elevation_source=request.args.get("elevation_source", "auto"),
+            )
+        except RoutingError as exc:
+            return _json({"error": exc.message}, exc.status)
+        result["gpx_id"] = gpx_id
+        result["name"] = parsed["name"]
+        return _json(result)
+
     def get_index():
         # The HTML shell must stay revalidated: startup.sh rewrites it when
         # PHOTONSERVER changes, and a stale UI against a new API is confusing.
@@ -3002,6 +3606,8 @@ def simple_mbtiles_server(
                     "routing": True,
                     "mcp": True,
                     "gpx": True,
+                    "gpx_upload": True,
+                    "gpx_max_upload_bytes": gpx_max_upload_bytes,
                     "geocoding": bool(photon_url),
                     "mcp_tools": mcp_server.tool_names(),
                     "difficulty_data": dict(tile_data_features),
@@ -3456,6 +4062,49 @@ def simple_mbtiles_server(
             result["descent_m"] = descent
         return result
 
+    def tool_analyze_gpx(args):
+        gpx_id = args.get("gpx_id")
+        if not gpx_store.valid_id(gpx_id):
+            raise ToolError(
+                "gpx_id must be the id returned by POST /v1/gpx, plan_route or export_gpx"
+            )
+        identifier, version = _tiles_from_args(args)
+        categories = args.get("poi_categories")
+        if categories is not None and not isinstance(categories, (list, tuple)):
+            raise ToolError("poi_categories must be a list of category names")
+        try:
+            poi_max_off_km = float(args.get("poi_max_off_km", 1.0))
+        except (TypeError, ValueError):
+            raise ToolError("poi_max_off_km must be a number")
+        try:
+            parsed = _load_gpx_points(gpx_id)
+            result = analyze_gpx(
+                identifier,
+                version,
+                parsed["points"],
+                profile=args.get("profile") or "foot",
+                poi_categories=list(categories) if categories else None,
+                poi_max_off_km=poi_max_off_km,
+                elevation_source=args.get("elevation_source") or "auto",
+            )
+        except RoutingError as exc:
+            raise ToolError(exc.message)
+        result["gpx_id"] = gpx_id
+        result["gpx_url"] = _external_url("/v1/gpx/%s.gpx" % gpx_id)
+        result["name"] = parsed["name"]
+        if parsed["waypoints"]:
+            result["gpx_waypoints"] = [
+                {
+                    "name": w["name"],
+                    "lat": round(w["lat"], 5),
+                    "lon": round(w["lon"], 5),
+                }
+                for w in parsed["waypoints"][:20]
+            ]
+        result.setdefault("terrain_warnings", [])
+        result["warnings"] = [_SAFETY_NOTE]
+        return result
+
     mcp_server = MCPServer(
         server_name="sms",
         server_version="4.0.0",
@@ -3757,6 +4406,71 @@ def simple_mbtiles_server(
         tool_export_gpx,
     )
 
+    mcp_server.tool(
+        "analyze_gpx",
+        "Assess an existing GPX track against the map data: distance, "
+        "duration, ascent/descent, which way classes and surfaces it uses, how "
+        "much of it runs off any mapped way (off_network_km / "
+        "off_network_sections -- pathless terrain OR ways missing in the "
+        "tiles, either way unknown difficulty), tagged difficulty "
+        "(sac_scale, via ferrata, trail_visibility, mtb_scale) with the km "
+        "position on the track, marked hiking/cycling routes it follows, and "
+        "POIs along the corridor (huts, shelters, camp sites, water, "
+        "supermarkets, emergency by default) with their km position and "
+        "distance off the track plus the longest gap per category "
+        "(poi_summary.max_gap_km = longest stretch without e.g. water). "
+        "The track must already be on the server: upload it with POST /v1/gpx "
+        "(raw gpx body or multipart 'file') which returns the gpx_id, or use "
+        "the gpx_id of a plan_route / export_gpx result. No geometry is "
+        "returned. " + _SAFETY_NOTE,
+        {
+            "type": "object",
+            "properties": {
+                "gpx_id": {
+                    "type": "string",
+                    "description": "id from POST /v1/gpx, plan_route or export_gpx",
+                },
+                "profile": {
+                    "type": "string",
+                    "enum": ["foot", "bike"],
+                    "default": "foot",
+                    "description": "used for the duration estimate",
+                },
+                "poi_categories": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": sorted(_POI_CATEGORY_FILTERS),
+                    },
+                    "description": "POI categories to look for along the track; "
+                    "default: %s" % ", ".join(_GPX_POI_DEFAULT_CATEGORIES),
+                },
+                "poi_max_off_km": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "maximum": 5,
+                    "default": 1.0,
+                    "description": "how far off the track a POI may be to count; "
+                    "also widens the tile corridor",
+                },
+                "elevation_source": {
+                    "type": "string",
+                    "enum": ["auto", "gpx", "contours"],
+                    "default": "auto",
+                    "description": "auto uses the track's own <ele> when at least "
+                    "90 % of points carry it, else contours; force contours to "
+                    "cross-check a noisy GPS profile",
+                },
+                "tileset": {
+                    "type": "string",
+                    "description": "identifier@version; default is the first tileset",
+                },
+            },
+            "required": ["gpx_id"],
+        },
+        tool_analyze_gpx,
+    )
+
     def post_mcp():
         payload, status = mcp_server.handle_raw(request.get_data())
         if payload is None:
@@ -3787,6 +4501,8 @@ def simple_mbtiles_server(
     app.add_url_rule("/mcp", view_func=post_mcp, methods=["POST"])
     app.add_url_rule("/mcp", view_func=get_mcp, methods=["GET"], endpoint="get_mcp")
     app.add_url_rule("/v1/gpx/<string:gpx_id>.gpx", view_func=get_gpx)
+    app.add_url_rule("/v1/gpx", view_func=post_gpx, methods=["POST"])
+    app.add_url_rule("/v1/gpx/<string:gpx_id>/analysis", view_func=get_gpx_analysis)
     app.add_url_rule("/v1/poi/<string:identifier>@<string:version>", view_func=get_poi)
     app.add_url_rule(
         "/v1/route/<string:identifier>@<string:version>", view_func=get_route
@@ -3939,6 +4655,7 @@ def main():
             gpx_dir=env.get("GPX_DIR"),
             gpx_max_files=env_int("GPX_MAX_FILES", 200),
             gpx_ttl_seconds=env_int("GPX_TTL_SECONDS", 86400),
+            gpx_max_upload_bytes=env_int("GPX_MAX_UPLOAD_BYTES", 10 * 1024 * 1024),
             route_max_tiles=env_int("ROUTE_MAX_TILES", 1200),
             route_max_crow_km=env_float("ROUTE_MAX_CROW_KM", 50.0),
         )
